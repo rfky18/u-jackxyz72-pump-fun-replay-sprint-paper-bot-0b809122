@@ -21,6 +21,15 @@
 //     refused, so the bot only ever fills when the price held still over
 //     the latency window. That single rule removes most of the worst
 //     entries; without it the same policy loses ~2.5 SOL.
+//   - The decision-time price is the batch-END price, so the slippage
+//     rule cannot see a spike that fired INSIDE the batch: a coin that
+//     rocketed 0 -> 85 SOL inside one slot shows the bot its top price
+//     as the decision price. A second filter screens those out directly:
+//     skip a crossing when the mint's price already rose more than 3%
+//     inside this very batch.
+//   - Sells use the widest slippage (10000 bps) so an exit always
+//     executes: in a fast dump a capped sell is rejected again and again
+//     while the position bleeds to nothing.
 //   - Size is built by pyramiding winners only: the bot scales a position
 //     up toward 0.5 SOL while its mark stays at or above entry, and never
 //     adds while under water, so winning coins end up bigger than losers.
@@ -35,14 +44,21 @@ import { runBot, LAMPORTS_PER_SOL } from './vendor/makefun-bot.ts';
 import type { Batch, BotState, OrderInput } from './vendor/makefun-bot.ts';
 
 const SOL = LAMPORTS_PER_SOL; // 1_000_000_000n lamports
-const TARGET_LAMPORTS = SOL / 2n; // 0.5 SOL target per position
+const TARGET_LAMPORTS = (SOL * 3n) / 10n; // 0.3 SOL target per position
 const MIN_BUY_LAMPORTS = (SOL * 2n) / 100n; // 0.02 SOL smallest useful buy
 const MAX_POSITIONS = 5;
 // Tight buy slippage is the entry filter: fills that chased a spike are
-// rejected for free instead of buying the top. Sells get wide slippage so
-// an exit actually executes in a dump.
+// rejected for free instead of buying the top. Sells get the widest
+// slippage so an exit ALWAYS executes: in a fast dump a 20% slip cap
+// rejects the sell again and again while the position bleeds to nothing.
+// The decision-time price is the batch-END price, so the buy filter
+// cannot see a spike that happened inside the batch — the intra-batch
+// rise filter below (MAX_BATCH_RISE) is what screens those out.
 const BUY_SLIPPAGE_BPS = 200;
-const SELL_SLIPPAGE_BPS = 2000;
+const SELL_SLIPPAGE_BPS = 10000;
+// Skip a crossing when the mint's price already spiked inside this very
+// batch (a 1-slot rocket): buying its batch-end top is buying the top.
+const MAX_BATCH_RISE = 1.03; // +3% within the batch
 
 // Entry: real SOL crossing 1 SOL from below (first sight counts as a
 // crossing when the mint is first seen already above it).
@@ -131,6 +147,27 @@ function decideOrders(state: BotState, batch: Batch): OrderInput[] {
   const orders: OrderInput[] = [];
   const nowSlot = batch.slot;
 
+  // Intra-batch price rise per mint: pre-trade price of its first trade in
+  // this batch vs post-trade price of its last trade. A rocket that fired
+  // inside this batch shows up here even though the decision-time price
+  // (batch end) already includes it.
+  const firstPre = new Map<string, number>();
+  const lastPost = new Map<string, number>();
+  for (const e of batch.events) {
+    if (e.event !== 'TradeEvent') continue;
+    const post = priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves));
+    if (!firstPre.has(e.mint)) {
+      const q = BigInt(e.quote_amount);
+      const t = BigInt(e.token_amount);
+      const vq = BigInt(e.virtual_quote_reserves);
+      const vt = BigInt(e.virtual_token_reserves);
+      const preVq = e.is_buy ? vq - q : vq + q;
+      const preVt = e.is_buy ? vt + t : vt - t;
+      firstPre.set(e.mint, priceOf(preVq, preVt));
+    }
+    lastPost.set(e.mint, post);
+  }
+
   // --- Exits: TP / SL / max hold on every held position. ---
   // Never re-issue a sell while one is already in flight for the mint:
   // the first sell fills 2 slots later, and duplicates only burn tx fees.
@@ -172,10 +209,10 @@ function decideOrders(state: BotState, batch: Batch): OrderInput[] {
     if (!curve || curve.complete) continue;
     const s = stats.get(mint);
     if (!s || s.entryPrice === 0) continue;
-    // Pyramid winners only: top up while the mark is at or above entry,
-    // never average down a loser.
+    // Pyramid winners only: top up while the mark is at least 2% above
+    // entry, never average down a loser.
     const mark = priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves);
-    if (mark <= 0 || mark < s.entryPrice) continue;
+    if (mark <= 0 || mark < s.entryPrice * 1.02) continue;
     const cap = state.maxBuyLamports(mint);
     let amount = TARGET_LAMPORTS - held.cost_lamports;
     if (amount > cap) amount = cap;
@@ -198,6 +235,11 @@ function decideOrders(state: BotState, batch: Batch): OrderInput[] {
     const s = stats.get(mint);
     if (!s) continue;
     if (nowSlot - s.lastExitSlot < REENTRY_COOLDOWN_SLOTS) continue;
+    // Skip spike batches: the coin already ran inside this batch, and
+    // buying its batch-end price is buying the top of that run.
+    const pre = firstPre.get(mint);
+    const last = lastPost.get(mint);
+    if (pre !== undefined && last !== undefined && pre > 0 && last / pre > MAX_BATCH_RISE) continue;
     // Fresh entry: needs a free position slot.
     if (state.committedPositionCount() + buysThisReply() >= MAX_POSITIONS) continue;
     const cap = state.maxBuyLamports(mint);
